@@ -56,6 +56,7 @@
   select.cond.good{color:var(--green); border-color:#bcdcc8; background:var(--greenbg)}
   select.cond.monitor{color:var(--amber); border-color:#e3d6b6; background:var(--amberbg)}
   select.cond.repair{color:var(--red); border-color:#e3c8c8; background:var(--redbg)}
+  select.cond.na{color:var(--muted); border-color:var(--line); background:#eef1f5}
   .capture{border:1px dashed var(--line); border-radius:10px; padding:11px; margin-top:11px; background:#fafbfc}
   .thumbs{display:flex; flex-wrap:wrap; gap:8px; margin-bottom:9px}
   .thumb{position:relative; width:84px; height:84px; border-radius:8px; overflow:hidden; border:1px solid var(--line); background:#eef1f5}
@@ -101,6 +102,7 @@
   .badge.good{background:var(--greenbg); color:var(--green)}
   .badge.monitor{background:var(--amberbg); color:var(--amber)}
   .badge.repair{background:var(--redbg); color:var(--red)}
+  .badge.na{background:#eef1f5; color:var(--muted)}
   .badge.count{background:#eef1f5; color:var(--navy)}
   .saved-bar{background:#fff; border:1px solid var(--line); border-radius:12px; margin:12px 0; padding:11px 13px}
   .saved-bar label{margin-top:0}
@@ -629,15 +631,16 @@ function clearStatus(){ const el=document.getElementById('savedMsg'); if(el){ el
 const COMP_OPTIONS = [
   "Roofing & Gutters","Exterior Paint / Siding","Walkways / Sidewalks","Parking & Asphalt",
   "Landscaping / Irrigation","Fencing & Gates","Exterior Lighting","Signage","Stairs & Railings",
-  "Decks / Balconies","Pool / Spa","Clubhouse","Mailboxes","Retaining Walls",
-  "Fire Safety & Suppression Systems","Other"
+  "Decks / Balconies","Patios","Pool / Spa","Clubhouse","Mailboxes","Garbage & Dumpster",
+  "Retaining Walls","Fire Safety & Suppression Systems","Other"
 ];
 // Bill's standard common-area set, pre-loaded as cards on every new inspection.
 const STANDARD_COMPONENTS = COMP_OPTIONS.filter(c=>c!=='Other');
 function seedStandardItems(){
   state.items = STANDARD_COMPONENTS.map(c=>({ id:uid(), comp:c, custom:"", condition:"", photos:[], note:"" }));
 }
-const COND_LABELS = { good:"Good", monitor:"Monitor", repair:"Needs Repair" };
+const COND_LABELS = { good:"Good", monitor:"Monitor", repair:"Needs Repair", na:"Not Applicable" };
+const COND_KEYS = ['good','monitor','repair','na'];
 const FIELDS = ["association","property","inspector","inspdate","insptype"];
 let state = { details:{}, items:[], sig:{} };
 let saveTimer = null;
@@ -648,19 +651,64 @@ function esc(s){ return (s||"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">
 function fmtStamp(ms){ const d=new Date(ms); return d.toLocaleString([], {year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}); }
 function compTitle(it){ const base = it.comp||'Component'; return it.custom ? base+' — '+it.custom : base; }
 function condColor(k){ return k==='good'?[47,125,79]:k==='monitor'?[154,107,30]:k==='repair'?[162,59,59]:[120,130,140]; }
+// A component is "reported" (shown in the PDF) only if it has a photo, a note, or a real
+// condition. "Not Applicable" and untouched components are skipped so pre-loaded cards
+// you don't use never clutter the report.
+function isReported(it){ return (it.photos&&it.photos.length) || (it.note||'').trim() || (it.condition && it.condition!=='na'); }
+
+/* ============================= STORAGE (IndexedDB — large quota for photos) ============================= */
+const DB_NAME='bnr_hoa_db', DB_STORE='kv';
+let _dbPromise=null;
+function idbOpen(){
+  if(_dbPromise) return _dbPromise;
+  _dbPromise=new Promise((res,rej)=>{
+    let req; try{ req=indexedDB.open(DB_NAME,1); }catch(e){ return rej(e); }
+    req.onupgradeneeded=()=>{ try{ req.result.createObjectStore(DB_STORE); }catch(e){} };
+    req.onsuccess=()=>res(req.result);
+    req.onerror=()=>rej(req.error||new Error('IndexedDB open failed'));
+  });
+  return _dbPromise;
+}
+function idbGet(key){
+  return idbOpen().then(db=>new Promise((res,rej)=>{
+    const t=db.transaction(DB_STORE,'readonly'); const rq=t.objectStore(DB_STORE).get(key);
+    rq.onsuccess=()=>res(rq.result); rq.onerror=()=>rej(rq.error);
+  }));
+}
+function idbSet(key,val){
+  return idbOpen().then(db=>new Promise((res,rej)=>{
+    const t=db.transaction(DB_STORE,'readwrite'); t.objectStore(DB_STORE).put(val,key);
+    t.oncomplete=()=>res(true); t.onerror=()=>rej(t.error); t.onabort=()=>rej(t.error||new Error('write aborted'));
+  }));
+}
+function idbDel(key){
+  return idbOpen().then(db=>new Promise((res,rej)=>{
+    const t=db.transaction(DB_STORE,'readwrite'); t.objectStore(DB_STORE).delete(key);
+    t.oncomplete=()=>res(true); t.onerror=()=>rej(t.error);
+  }));
+}
 
 /* ============================= PERSISTENCE ============================= */
-const LSKEY="bnr_hoa_inspection_v1";
 function collectDetails(){ FIELDS.forEach(f=>{ const el=document.getElementById("f_"+f); if(el) state.details[f]=el.value; }); }
 function debounceSave(){ clearTimeout(saveTimer); saveTimer=setTimeout(()=>saveNow(false),700); }
-function loadSaved(){
+async function persistCurrent(){
+  try{ await idbSet('current', state); return true; }
+  catch(e){ showStatus('⚠ Save failed: '+((e&&e.message)||'storage error'), true); return false; }
+}
+async function loadSaved(){
   try{
-    const raw=localStorage.getItem(LSKEY); if(!raw) return false;
-    const s=JSON.parse(raw); if(!s||!s.items) return false;
+    const s=await idbGet('current'); if(!s||!s.items) return false;
     state=s; if(!state.sig) state.sig={};
     FIELDS.forEach(f=>{ const el=document.getElementById("f_"+f); if(el) el.value=state.details[f]||""; });
     return true;
   }catch(e){ return false; }
+}
+// One-time migration: pull any data the old localStorage build saved into IndexedDB.
+async function migrateFromLocalStorage(){
+  try{
+    if(!(await idbGet('current'))){ const old=localStorage.getItem('bnr_hoa_inspection_v1'); if(old) await idbSet('current', JSON.parse(old)); }
+    if(!(await idbGet('store'))){ const olds=localStorage.getItem('bnr_hoa_inspection_store_v1'); if(olds) await idbSet('store', JSON.parse(olds)); }
+  }catch(e){}
 }
 
 /* ============================= IMAGE HANDLING ============================= */
@@ -684,23 +732,23 @@ async function onPhoto(itemId, input){
   const files=[...input.files]; input.value="";
   const it=state.items.find(a=>a.id===itemId); if(!it) return;
   for(const f of files){ try{ const p=await fileToPhoto(f); it.photos.push(p); }catch(e){ alert("Couldn't load a photo: "+e); } }
-  saveNow(false); render();
+  render(); saveNow(false);
 }
 function removePhoto(itemId, photoId){
   const it=state.items.find(a=>a.id===itemId); if(!it) return;
   it.photos=it.photos.filter(p=>p.id!==photoId);
-  saveNow(false); render();
+  render(); saveNow(false);
 }
 
 /* ============================= COMPONENTS ============================= */
 function addArea(){
   state.items.push({ id:uid(), comp:COMP_OPTIONS[0], custom:"", condition:"", photos:[], note:"" });
-  saveNow(false); render();
+  render(); saveNow(false);
   setTimeout(()=>{ const els=document.querySelectorAll('.areacard'); if(els.length) els[els.length-1].scrollIntoView({behavior:'smooth',block:'center'}); },60);
 }
 function deleteArea(id){
   if(!confirm("Delete this component and its photos?")) return;
-  state.items=state.items.filter(a=>a.id!==id); saveNow(false); render();
+  state.items=state.items.filter(a=>a.id!==id); render(); saveNow(false);
 }
 function setItemField(id,field,val){ const a=state.items.find(x=>x.id===id); if(a){ a[field]=val; debounceSave(); if(field==='condition'||field==='comp') render(); } }
 function setItemCustom(id,val){ const a=state.items.find(x=>x.id===id); if(a){ a.custom=val; debounceSave(); } }
@@ -732,7 +780,7 @@ function render(){
     const opts = COMP_OPTIONS.map(o=>`<option ${o===it.comp?'selected':''}>${o}</option>`).join("");
     const condCls = it.condition||'';
     const condOpts = `<option value="" ${!it.condition?'selected':''}>— Condition —</option>`+
-      ['good','monitor','repair'].map(k=>`<option value="${k}" ${it.condition===k?'selected':''}>${COND_LABELS[k]}</option>`).join("");
+      COND_KEYS.map(k=>`<option value="${k}" ${it.condition===k?'selected':''}>${COND_LABELS[k]}</option>`).join("");
     const condBadge = it.condition ? `<span class="badge ${it.condition}">${COND_LABELS[it.condition]}</span>` : '';
     const ph = it.photos;
     const thumbs = ph.map(p=>`
@@ -793,28 +841,26 @@ function importProject(input){
       if(state.sig.inspectorSig && state.sig.inspectorSig.length>200) setTimeout(()=>restoreSig('inspector',state.sig.inspectorSig),150);
       if(state.sig.boardSig && state.sig.boardSig.length>200) setTimeout(()=>restoreSig('board',state.sig.boardSig),150);
     } else { if(stn) stn.value=''; if(sdt) sdt.value=''; }
-    saveNow(true); render();
+    render(); saveNow(true);
     document.getElementById('menuDlg').close();
   }catch(e){ alert("Couldn't read file: "+e); } };
   r.readAsText(f);
 }
-function clearAll(){
+async function clearAll(){
   if(!confirm("Start a new blank inspection? Save or export your current one first if you need it.")) return;
-  state={details:{},items:[],sig:{}};
-  state._localId=null;
+  state={details:{},items:[],sig:{}}; state._localId=null;
   FIELDS.forEach(f=>{ const el=document.getElementById("f_"+f); if(el) el.value=""; });
   clearSig('inspector'); clearSig('board');
   const stn=document.getElementById('sig_inspector_name'); if(stn) stn.value='';
   const sdt=document.getElementById('sig_date'); if(sdt) sdt.value='';
-  localStorage.removeItem(LSKEY); seedStandardItems(); render();
+  seedStandardItems(); render(); await persistCurrent();
   document.getElementById('menuDlg').close();
 }
 
-/* ============================= SAVED INSPECTIONS (local store) ============================= */
-const STOREKEY="bnr_hoa_inspection_store_v1";
-function readStore(){ try{ const raw=localStorage.getItem(STOREKEY); const a=raw?JSON.parse(raw):[]; return Array.isArray(a)?a:[]; }catch(e){ return []; } }
-function writeStore(list){ try{ localStorage.setItem(STOREKEY, JSON.stringify(list)); return true; }catch(e){ showStatus('⚠ Storage full — export a .json backup and delete old saves', true); return false; } }
-function loadRemoteInspectionList(){ const rows=readStore().slice().sort((a,b)=>(b.updated_at||'').localeCompare(a.updated_at||'')); populateSavedDropdown(rows); }
+/* ============================= SAVED INSPECTIONS (on-device store) ============================= */
+async function readStore(){ try{ const a=await idbGet('store'); return Array.isArray(a)?a:[]; }catch(e){ return []; } }
+async function writeStore(list){ try{ await idbSet('store', list); return true; }catch(e){ showStatus('⚠ Could not update saved list: '+((e&&e.message)||''), true); return false; } }
+async function loadRemoteInspectionList(){ const rows=(await readStore()).slice().sort((a,b)=>(b.updated_at||'').localeCompare(a.updated_at||'')); populateSavedDropdown(rows); }
 function populateSavedDropdown(rows){
   const sel=document.getElementById('savedSelect'); if(!sel) return;
   const current=sel.value;
@@ -824,7 +870,7 @@ function populateSavedDropdown(rows){
   if(state._localId && rows.some(r=>r.id===state._localId)) sel.value=state._localId;
   else if(rows.some(r=>r.id===current)) sel.value=current;
 }
-function saveRemote(){
+async function saveRemote(){
   collectDetails(); state.sig=collectSignatures();
   const name=state.details.association||state.details.property;
   if(!name) return; // don't store unnamed inspections in the picker
@@ -834,18 +880,18 @@ function saveRemote(){
   const label=name+propPart+' — '+ts;
   if(!state._localId) state._localId=uid();
   const entry={ id:state._localId, address:name, label, updated_at:new Date().toISOString(), data:state };
-  const list=readStore();
+  const list=await readStore();
   const i=list.findIndex(r=>r.id===state._localId);
   if(i>=0) list[i]=entry; else list.push(entry);
-  writeStore(list);
-  loadRemoteInspectionList();
+  await writeStore(list);
+  await loadRemoteInspectionList();
 }
-function deleteRemoteInspection(id){ writeStore(readStore().filter(r=>r.id!==id)); }
+async function deleteRemoteInspection(id){ await writeStore((await readStore()).filter(r=>r.id!==id)); }
 function onSavedSelectChange(){ /* selection only; Load button applies it */ }
-function loadSelectedInspection(){
+async function loadSelectedInspection(){
   const sel=document.getElementById('savedSelect');
   if(!sel||!sel.value){ alert('Pick a saved inspection first.'); return; }
-  const row=readStore().find(r=>r.id===sel.value);
+  const row=(await readStore()).find(r=>r.id===sel.value);
   if(!row||!row.data){ alert('Could not find that saved inspection.'); return; }
   state=row.data; state._localId=row.id;
   if(!state.sig) state.sig={};
@@ -856,26 +902,26 @@ function loadSelectedInspection(){
   if(state.sig.inspectorSig && state.sig.inspectorSig.length>200) setTimeout(()=>restoreSig('inspector',state.sig.inspectorSig),150);
   if(state.sig.boardSig && state.sig.boardSig.length>200) setTimeout(()=>restoreSig('board',state.sig.boardSig),150);
   render();
-  try{ localStorage.setItem(LSKEY, JSON.stringify(state)); }catch(e){}
+  await persistCurrent();
   showStatus('✓ Loaded');
 }
-function deleteSelectedInspection(){
+async function deleteSelectedInspection(){
   const sel=document.getElementById('savedSelect');
   if(!sel||!sel.value){ alert('Pick a saved inspection to delete.'); return; }
   if(!confirm('Delete this saved inspection? This only removes it from this device’s list.')) return;
   const id=sel.value;
-  deleteRemoteInspection(id);
+  await deleteRemoteInspection(id);
   if(state._localId===id) state._localId=null;
-  loadRemoteInspectionList();
+  await loadRemoteInspectionList();
   sel.value='';
   showStatus('✓ Deleted');
 }
 
 /* ============================= SAVE (on-device) ============================= */
-function saveNow(showMsg){
+async function saveNow(showMsg){
   collectDetails(); state.sig=collectSignatures();
-  try{ localStorage.setItem(LSKEY, JSON.stringify(state)); }catch(e){}
-  if(showMsg){ saveRemote(); showStatus('✓ Saved on this device'); }
+  const ok=await persistCurrent();
+  if(showMsg && ok){ await saveRemote(); showStatus('✓ Saved on this device'); }
 }
 
 /* ============================= SIGNATURE PADS ============================= */
@@ -926,11 +972,11 @@ function collectSignatures(){
   };
 }
 
-/* ============================= EXPORT PDF ============================= */
+/* ============================= EXPORT / SHARE PDF ============================= */
 async function exportPDF(){
-  state.sig=collectSignatures(); collectDetails(); saveNow(false);
+  state.sig=collectSignatures(); collectDetails(); saveNow(false); // persist runs in background
   if(!state.items.length){ alert("Add at least one component first."); return; }
-  const reported = state.items.filter(it=> (it.photos&&it.photos.length) || it.condition || (it.note||'').trim());
+  const reported = state.items.filter(isReported);
   if(!reported.length){ alert("Add a photo, condition, or note to at least one component first."); return; }
   const { jsPDF } = window.jspdf;
   const doc=new jsPDF({unit:'pt',format:'letter'});
@@ -973,15 +1019,20 @@ async function exportPDF(){
   }
   header1(); footer();
 
-  const imgW=CW*0.46, imgH=150, gap=14, lineH=11;
+  const gap=14, lineH=11;
+  const cols=3, pgap=12;
+  const pw=(CW-(cols-1)*pgap)/cols, phH=128;
   for(const it of reported){
     doc.setFontSize(8.5); doc.setFont('helvetica','normal');
-    const note=doc.splitTextToSize(it.note||"—", CW-imgW-gap-6);
+    const note=doc.splitTextToSize(it.note||"—", CW-6);
     const noteLines=Math.max(note.length,1);
-    const rightH=16+noteLines*lineH+4;
-    const blockH=22+Math.max(imgH,rightH)+14;
+    const nPhotos=Math.min(it.photos.length,3);
+    const photoBandH = it.photos.length ? phH+12 : 0;
+    const condLineH = it.condition ? 14 : 0;
+    const blockH = 18+8 + photoBandH + condLineH + noteLines*lineH + 16;
     if(y+blockH > PH-46){ doc.addPage(); y=46; footer(); }
 
+    // title bar (full width) + condition tag
     doc.setFillColor(...NAVY); doc.roundedRect(M,y,CW,18,3,3,'F');
     doc.setFont('helvetica','bold'); doc.setFontSize(10); doc.setTextColor(255,255,255);
     doc.text(compTitle(it), M+8, y+12.5, {maxWidth:CW-150});
@@ -993,42 +1044,42 @@ async function exportPDF(){
     }
     y+=18+8;
 
-    const topY=y;
-    doc.setDrawColor(...LINE); doc.setFillColor(238,241,245); doc.setLineWidth(.8);
-    doc.roundedRect(M,topY,imgW,imgH,4,4,'FD');
-    const ph=it.photos[0];
-    if(ph){
-      const ar=ph.w/ph.h; let dw=imgW-4, dh=dw/ar; if(dh>imgH-4){ dh=imgH-4; dw=dh*ar; }
-      const ix=M+(imgW-dw)/2, iy=topY+(imgH-dh)/2;
-      try{ doc.addImage(ph.data,'JPEG',ix,iy,dw,dh); }catch(e){}
-      doc.setFont('helvetica','normal'); doc.setFontSize(7); doc.setTextColor(255,255,255);
-      const st=fmtStamp(ph.ts); const sw=doc.getTextWidth(st)+6;
-      doc.setFillColor(0,0,0); doc.setGState && doc.setGState(new doc.GState({opacity:.55}));
-      doc.rect(ix+dw-sw, iy+dh-12, sw, 12,'F');
-      doc.setGState && doc.setGState(new doc.GState({opacity:1}));
-      doc.text(st, ix+dw-3, iy+dh-3, {align:'right'});
-      if(it.photos.length>1){
-        doc.setFillColor(...NAVY); doc.setGState && doc.setGState(new doc.GState({opacity:.85}));
-        doc.roundedRect(ix+4, iy+4, 54, 13, 3,3,'F');
+    // up to 3 photos across the full width
+    if(it.photos.length){
+      for(let i=0;i<nPhotos;i++){
+        const cx=M + i*(pw+pgap);
+        doc.setDrawColor(...LINE); doc.setFillColor(238,241,245); doc.setLineWidth(.8);
+        doc.roundedRect(cx,y,pw,phH,4,4,'FD');
+        const p=it.photos[i];
+        const ar=p.w/p.h; let dw=pw-4, dh=dw/ar; if(dh>phH-4){ dh=phH-4; dw=dh*ar; }
+        const ix=cx+(pw-dw)/2, iy=y+(phH-dh)/2;
+        try{ doc.addImage(p.data,'JPEG',ix,iy,dw,dh); }catch(e){}
+        doc.setFont('helvetica','normal'); doc.setFontSize(6.5); doc.setTextColor(255,255,255);
+        const st=fmtStamp(p.ts); const sw=doc.getTextWidth(st)+5;
+        doc.setFillColor(0,0,0); doc.setGState && doc.setGState(new doc.GState({opacity:.55}));
+        doc.rect(ix+dw-sw, iy+dh-11, sw, 11,'F');
         doc.setGState && doc.setGState(new doc.GState({opacity:1}));
-        doc.setTextColor(255,255,255); doc.setFontSize(7);
-        doc.text("+"+(it.photos.length-1)+" more", ix+8, iy+13);
+        doc.text(st, ix+dw-3, iy+dh-3, {align:'right'});
+        if(i===nPhotos-1 && it.photos.length>3){
+          doc.setFillColor(...NAVY); doc.setGState && doc.setGState(new doc.GState({opacity:.85}));
+          doc.roundedRect(cx+4, y+4, 52, 13, 3,3,'F');
+          doc.setGState && doc.setGState(new doc.GState({opacity:1}));
+          doc.setTextColor(255,255,255); doc.setFontSize(7);
+          doc.text("+"+(it.photos.length-3)+" more", cx+8, y+13);
+        }
       }
-    } else {
-      doc.setFont('helvetica','italic'); doc.setFontSize(9); doc.setTextColor(...MUT);
-      doc.text("No photo", M+imgW/2, topY+imgH/2, {align:'center'});
+      y += phH+12;
     }
 
-    const rx=M+imgW+gap; let ry=topY+4;
-    if(it.condition){ const cc=condColor(it.condition); doc.setFont('helvetica','bold'); doc.setFontSize(9); doc.setTextColor(...cc); doc.text("Condition: "+COND_LABELS[it.condition], rx, ry+8); ry+=16; } else { ry+=4; }
+    // condition + comments below (full width)
+    if(it.condition){ const cc=condColor(it.condition); doc.setFont('helvetica','bold'); doc.setFontSize(9); doc.setTextColor(...cc); doc.text("Condition: "+COND_LABELS[it.condition], M, y+8); y+=14; }
     doc.setFont('helvetica','normal'); doc.setFontSize(8.5); doc.setTextColor(40,50,60);
-    doc.text(note, rx, ry+8);
-
-    y = topY + Math.max(imgH, rightH) + 14;
+    doc.text(note, M, y+8);
+    y += noteLines*lineH + 16;
   }
 
-  // Additional photos appendix
-  let appendixNeeded=reported.some(i=>i.photos.length>1);
+  // Additional photos appendix (photos beyond the first 3)
+  let appendixNeeded=reported.some(i=>i.photos.length>3);
   if(appendixNeeded){
     doc.addPage(); y=46; footer();
     doc.setFont('helvetica','bold'); doc.setFontSize(13); doc.setTextColor(...NAVY);
@@ -1036,7 +1087,7 @@ async function exportPDF(){
     doc.setDrawColor(...NAVY); doc.setLineWidth(1); doc.line(M,y,PW-M,y); y+=16;
     const tW=(CW-2*gap)/3, tH=tW*0.75; let cx=M, col=0;
     for(const it of reported){
-      const extra=it.photos.slice(1);
+      const extra=it.photos.slice(3);
       for(const p of extra){
         if(y+tH+22>PH-46){ doc.addPage(); y=46; footer(); cx=M; col=0; }
         doc.setFont('helvetica','bold'); doc.setFontSize(7.5); doc.setTextColor(...NAVY);
@@ -1078,16 +1129,32 @@ async function exportPDF(){
   drawSigBox(M+sigW+gap,"Board Representative",sig.boardSig||'');
 
   const fname=(state.details.association||state.details.property||'HOA_Inspection').replace(/[^a-z0-9]+/gi,'_').slice(0,40)+"_HOA_Inspection.pdf";
-  doc.save(fname);
+
+  // On iPhone, open the share sheet so the report can be texted/emailed directly.
+  // Fall back to a normal download where file-sharing isn't supported (e.g. desktop).
+  const blob = doc.output('blob');
+  let shared=false;
+  try{
+    if(navigator.canShare){
+      const file=new File([blob], fname, {type:'application/pdf'});
+      if(navigator.canShare({files:[file]})){
+        await navigator.share({ files:[file], title:'HOA Inspection — '+(state.details.association||'Terra Vista'), text:'HOA component condition inspection report.' });
+        shared=true;
+      }
+    }
+  }catch(e){ if(e && e.name==='AbortError') shared=true; } // user cancelled the share sheet
+  if(!shared){ doc.save(fname); }
 }
 
 /* ============================= INIT ============================= */
-window.addEventListener('DOMContentLoaded',()=>{
+window.addEventListener('DOMContentLoaded', async ()=>{
   FIELDS.forEach(f=>{ const el=document.getElementById("f_"+f); if(el) el.addEventListener('input',debounceSave); });
-  if(!loadSaved()){ seedStandardItems(); saveNow(false); }
+  await migrateFromLocalStorage();
+  const had=await loadSaved();
+  if(!had){ seedStandardItems(); await persistCurrent(); }
   render();
   if(!document.getElementById('f_inspector').value){ document.getElementById('f_inspector').value="Bill Phillips"; }
-  loadRemoteInspectionList();
+  await loadRemoteInspectionList();
   initSigPad('inspector','sigCanvasInspector');
   initSigPad('board','sigCanvasBoard');
   if(state.sig){
