@@ -629,10 +629,14 @@ function clearStatus(){ const el=document.getElementById('savedMsg'); if(el){ el
 
 /* ============================= CONSTANTS / STATE ============================= */
 const COMP_OPTIONS = [
-  "Roofing & Gutters","Exterior Paint / Siding","Walkways / Sidewalks","Parking & Asphalt",
-  "Landscaping / Irrigation","Fencing & Gates","Exterior Lighting","Signage","Stairs & Railings",
-  "Decks / Balconies","Patios","Pool / Spa","Clubhouse","Mailboxes","Garbage & Dumpster",
-  "Retaining Walls","Fire Safety & Suppression Systems","Other"
+  // Main areas — alphabetical
+  "Decks / Balconies / Patios","Drainage Systems","Exterior Lighting","Exterior Paint / Siding",
+  "Exterior Windows","Fencing & Gates","Fire Safety & Suppression Systems","Garbage & Dumpster",
+  "Landscaping / Irrigation","Mailboxes","Parking & Asphalt","Retaining Walls","Roofing & Gutters",
+  "Signage","Stairs & Railings","Walkways / Sidewalks",
+  // Optional areas (not every association has these) — kept at the bottom
+  "Clubhouse","Garages","Pool / Spa",
+  "Other"
 ];
 // Bill's standard common-area set, pre-loaded as cards on every new inspection.
 const STANDARD_COMPONENTS = COMP_OPTIONS.filter(c=>c!=='Other');
